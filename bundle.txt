@@ -1,0 +1,1357 @@
+=====FILE: app/build.gradle.kts=====
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.example.fluidnotif"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.fluidnotif"
+        minSdk = 31
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
+}
+=====FILE: app/src/main/AndroidManifest.xml=====
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".SettingsActivity" android:exported="false" />
+        <activity android:name=".TestActivity" android:exported="false" />
+
+        <service
+            android:name=".NotifService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
+=====FILE: app/src/main/java/com/example/fluidnotif/Fakes.kt=====
+package com.example.fluidnotif
+
+import android.content.Context
+import android.widget.Toast
+
+/** Fake notification scenarios for the test lab and the settings preview. */
+class Fake(
+    val app: String,
+    val title: String,
+    val text: String,
+    val color: Int,
+    val canReply: Boolean = true
+) {
+    fun toData(ctx: Context, toasts: Boolean = true): NotifData {
+        val app = ctx.applicationContext
+        fun t(s: String) { if (toasts) Toast.makeText(app, s, Toast.LENGTH_SHORT).show() }
+        val letter = this.app.firstOrNull()?.uppercase() ?: "?"
+        return NotifData(
+            appName = this.app,
+            icon = { LetterIcon(color, letter) },
+            title = title,
+            text = text,
+            canReply = canReply,
+            onOpen = { t("Opened: $title") },
+            onRead = { t("Marked as read") },
+            onReply = { t("Sent: $it") }
+        )
+    }
+}
+
+object Fakes {
+    val scenarios = listOf(
+        Fake("Messages", "Emily", "Yup, it was the little bakery on the corner. Want to come along on Saturday?", 0xFF5B6CFF.toInt()),
+        Fake("Chat Business", "Chat Business", "New message from a customer", 0xFF2BB673.toInt()),
+        Fake("Mail", "Alex Rivera", "Quarterly report: please review the attached numbers before Friday's meeting and send me your comments when you can.", 0xFFE5483D.toInt(), false),
+        Fake("Calendar", "Meeting in 10 minutes", "Design sync · Room 4B", 0xFF2F80ED.toInt(), false),
+        Fake("Delivery", "Courier is nearby", "Your order will arrive in about 5 minutes", 0xFFF2994A.toInt(), false),
+        Fake("Bank", "Payment received", "+ \$240.00 from Sam", 0xFF27AE60.toInt(), false)
+    )
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/GlassCardView.kt=====
+package com.example.fluidnotif
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.RenderEffect
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.text.TextUtils
+import android.view.Gravity
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.dynamicanimation.animation.FloatPropertyCompat
+
+/**
+ * Glass notification card. [progress] 0 = small capsule at the camera,
+ * 1 = fully expanded card. Driven by a spring animation.
+ */
+class GlassCardView(context: Context, d: NotifData, private val st: Style) : FrameLayout(context) {
+
+    companion object {
+        val PROGRESS = object : FloatPropertyCompat<GlassCardView>("progress") {
+            override fun getValue(o: GlassCardView) = o.progress
+            override fun setValue(o: GlassCardView, value: Float) { o.progress = value }
+        }
+    }
+
+    /** Capsule rect (where the camera is) in this view's local coordinates. */
+    var startRect = RectF()
+
+    var progress = 0f
+        set(v) {
+            field = v
+            applyProgress()
+            invalidate()
+        }
+
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = context.dpF(st.edgeWDp)
+    }
+    private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = context.dpF(st.edgeWDp * 4f)
+        alpha = st.glowAlpha
+    }
+    private val rect = RectF()
+    private val content = LinearLayout(context)
+
+    private fun withA(c: Int, a: Int): Int = (c and 0x00FFFFFF) or (a.coerceIn(0, 255) shl 24)
+
+    init {
+        setWillNotDraw(false)
+
+        val cHeader = if (st.dark) 0xFFB0B0BA.toInt() else 0xFF6B6B73.toInt()
+        val cTitle = if (st.dark) 0xFFF4F4F8.toInt() else 0xFF121216.toInt()
+        val cBody = if (st.dark) 0xFFD0D0D8.toInt() else 0xFF4A4A52.toInt()
+        val s = st.textScale
+
+        content.orientation = LinearLayout.HORIZONTAL
+        content.gravity = Gravity.CENTER_VERTICAL
+        content.setPadding(dpI(16f), dpI(14f), dpI(16f), dpI(14f))
+
+        val icon = ImageView(context).apply {
+            setImageDrawable(d.icon())
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val isz = dpI(st.iconDp)
+        content.addView(icon, LinearLayout.LayoutParams(isz, isz))
+
+        val col = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(context).apply {
+            text = "${d.appName} · now"
+            textSize = 12f * s
+            setTextColor(cHeader)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        col.addView(TextView(context).apply {
+            text = d.title
+            textSize = 15.5f * s
+            setTextColor(cTitle)
+            setTypeface(typeface, Typeface.BOLD)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        col.addView(TextView(context).apply {
+            text = if (st.hide) "Message hidden" else d.text
+            textSize = 14f * s
+            setTextColor(cBody)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val lp = LinearLayout.LayoutParams(0, WRAP, 1f)
+        lp.marginStart = dpI(12f)
+        content.addView(col, lp)
+
+        addView(content, LayoutParams(MATCH, WRAP))
+        applyProgress()
+    }
+
+    private fun applyProgress() {
+        // Content fades in and un-blurs during the second half of the expansion.
+        val a = ((progress - 0.35f) / 0.5f).coerceIn(0f, 1f)
+        content.alpha = a
+        val r = (1f - a) * dpF(st.textBlurDp)
+        content.setRenderEffect(
+            if (r > 0.5f) RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP) else null
+        )
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val p = progress.coerceAtLeast(0f)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        rect.set(
+            lerp(startRect.left, 0f, p),
+            lerp(startRect.top, 0f, p),
+            lerp(startRect.right, w, p),
+            lerp(startRect.bottom, h, p)
+        )
+        val pad = if (st.edgeOn) stroke.strokeWidth / 2f else 0f
+        rect.inset(pad, pad)
+        val radius = lerp(startRect.height() / 2f, dpF(st.cornerDp), p.coerceAtMost(1f))
+
+        // Milky translucent glass body
+        val top = if (st.dark) 0x2E2E36 else 0xFFFFFF
+        val bot = if (st.dark) 0x17171C else 0xECECF2
+        fill.shader = LinearGradient(
+            rect.left, rect.top, rect.right, rect.bottom,
+            withA(top, st.glassAlpha), withA(bot, (st.glassAlpha * 0.82f).toInt()),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(rect, radius, radius, fill)
+
+        if (st.edgeOn) {
+            val edge = LinearGradient(
+                rect.left, rect.top, rect.right, rect.bottom,
+                st.c1, st.c2, Shader.TileMode.CLAMP
+            )
+            glow.shader = edge
+            stroke.shader = edge
+            canvas.drawRoundRect(rect, radius, radius, glow)
+            canvas.drawRoundRect(rect, radius, radius, stroke)
+        }
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/MainActivity.kt=====
+package com.example.fluidnotif
+
+import android.app.Activity
+import android.content.Intent
+import android.graphics.Typeface
+import android.net.Uri
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.core.app.NotificationManagerCompat
+
+class MainActivity : Activity() {
+
+    private lateinit var status: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpI(20f), dpI(48f), dpI(20f), dpI(24f))
+        }
+        col.addView(TextView(this).apply {
+            text = "Fluid Notifications"
+            textSize = 28f
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        col.addView(TextView(this).apply {
+            text = "Glass notifications that grow out of the camera."
+            textSize = 14f
+            setPadding(0, dpI(6f), 0, dpI(16f))
+        })
+
+        status = TextView(this).apply {
+            textSize = 15f
+            setPadding(0, 0, 0, dpI(12f))
+        }
+        col.addView(status)
+
+        fun btn(label: String, onClick: () -> Unit) {
+            col.addView(Button(this).apply {
+                text = label
+                isAllCaps = false
+                gravity = Gravity.CENTER
+                setOnClickListener { onClick() }
+            }, LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        btn("1. Notification access") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        btn("2. Display over other apps") {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+        }
+        btn("3. Battery: set to Unrestricted") {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+        col.addView(TextView(this).apply { setPadding(0, dpI(10f), 0, 0) })
+        btn("Settings & live preview") { startActivity(Intent(this, SettingsActivity::class.java)) }
+        btn("Test lab (fake notifications)") { startActivity(Intent(this, TestActivity::class.java)) }
+
+        col.addView(TextView(this).apply {
+            text = "Tip: on Samsung turn off the system pop-up so you don't see two " +
+                "(Settings → Notifications → Notification pop-up style → Brief)."
+            textSize = 13f
+            setPadding(0, dpI(16f), 0, 0)
+        })
+
+        setContentView(ScrollView(this).apply { addView(col) })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val access = NotificationManagerCompat.getEnabledListenerPackages(this).contains(packageName)
+        val overlay = Settings.canDrawOverlays(this)
+        status.text = (if (access) "✓" else "✗") + " Notification access\n" +
+            (if (overlay) "✓" else "✗") + " Display over other apps"
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/NotifPanel.kt=====
+package com.example.fluidnotif
+
+import android.content.Context
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.animation.OvershootInterpolator
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
+import kotlin.math.abs
+
+/**
+ * The whole notification UI: glass card + action pills, with open/close animations.
+ * Used both inside the system overlay window and inside the settings preview.
+ */
+class NotifPanel(
+    private val ctx: Context,
+    private val d: NotifData,
+    private val st: Style,
+    startRect: RectF,
+    cardTop: Int
+) : LinearLayout(ctx) {
+
+    val card = GlassCardView(ctx, d, st)
+    private val row = LinearLayout(ctx)
+    private val handler = Handler(Looper.getMainLooper())
+    private var autoClose: Runnable? = null
+    private var closing = false
+    private val fg = if (st.dark) 0xFFF4F4F8.toInt() else 0xFF121216.toInt()
+    private val hasButtons = st.buttons && (st.btnReply || st.btnRead)
+
+    var onClosed: (() -> Unit)? = null
+    var onNeedFocus: ((EditText) -> Unit)? = null
+
+    init {
+        orientation = VERTICAL
+        card.startRect = startRect
+        card.progress = 0f
+        addView(card, LayoutParams(MATCH, WRAP).apply { topMargin = cardTop.coerceAtLeast(0) })
+
+        row.orientation = HORIZONTAL
+        row.gravity = Gravity.CENTER_HORIZONTAL
+        if (hasButtons) {
+            addView(row, LayoutParams(MATCH, WRAP).apply { topMargin = dpI(8f) })
+            buildButtons()
+            row.alpha = 0f
+            row.translationY = -dpF(18f)
+            row.scaleX = 0.9f
+            row.scaleY = 0.9f
+        }
+
+        var downY = 0f
+        card.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { downY = e.rawY; true }
+                MotionEvent.ACTION_UP -> {
+                    val dy = e.rawY - downY
+                    if (dy < -dpF(28f)) {
+                        close()
+                    } else if (abs(dy) < dpF(8f)) {
+                        d.onOpen()
+                        close()
+                    }
+                    true
+                }
+                else -> true
+            }
+        }
+    }
+
+    fun open(haptic: Boolean = st.haptic) {
+        closing = false
+        if (haptic) card.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        SpringAnimation(card, GlassCardView.PROGRESS, 1f).apply {
+            spring.stiffness = st.openStiffness
+            spring.dampingRatio = st.openDamping
+            start()
+        }
+        if (hasButtons) {
+            row.animate()
+                .alpha(1f).translationY(0f).scaleX(1f).scaleY(1f)
+                .setStartDelay(st.btnDelay).setDuration(320)
+                .setInterpolator(OvershootInterpolator(1.4f))
+                .start()
+        }
+        scheduleAutoClose()
+    }
+
+    fun close() {
+        if (closing) return
+        closing = true
+        cancelAuto()
+        if (hasButtons) {
+            row.animate().alpha(0f).translationY(-dpF(10f)).setStartDelay(0).setDuration(160).start()
+        }
+        SpringAnimation(card, GlassCardView.PROGRESS, 0f).apply {
+            spring.stiffness = st.closeStiffness
+            spring.dampingRatio = SpringForce.DAMPING_RATIO_NO_BOUNCY
+            addEndListener { _, _, _, _ -> onClosed?.invoke() }
+            start()
+        }
+    }
+
+    fun release() {
+        cancelAuto()
+        handler.removeCallbacksAndMessages(null)
+        row.animate().cancel()
+    }
+
+    private fun scheduleAutoClose() {
+        cancelAuto()
+        autoClose = Runnable { close() }.also { handler.postDelayed(it, st.stayMs) }
+    }
+
+    private fun cancelAuto() {
+        autoClose?.let { handler.removeCallbacks(it) }
+        autoClose = null
+    }
+
+    private fun buildButtons() {
+        row.removeAllViews()
+        if (st.btnReply) {
+            row.addView(pill("Reply", d.icon()) {
+                if (d.canReply) showReply() else { d.onOpen(); close() }
+            })
+        }
+        if (st.btnRead) {
+            val check = ctx.getDrawable(R.drawable.ic_check)?.mutate()?.also { it.setTint(fg) }
+            row.addView(pill("Mark as read", check) {
+                d.onRead()
+                close()
+            }, LayoutParams(WRAP, WRAP).apply { marginStart = if (st.btnReply) dpI(8f) else 0 })
+        }
+    }
+
+    private fun showReply() {
+        cancelAuto()
+        row.removeAllViews()
+        val input = EditText(ctx).apply {
+            hint = "Reply…"
+            textSize = 15f
+            setSingleLine()
+            setTextColor(fg)
+            setHintTextColor(0xFF8A8A92.toInt())
+            setPadding(dpI(20f), 0, dpI(20f), 0)
+            background = glassBg()
+        }
+        row.addView(input, LayoutParams(0, dpI(48f), 1f))
+        row.addView(pill("Send", null) {
+            val text = input.text.toString().trim()
+            if (text.isNotEmpty()) d.onReply(text)
+            close()
+        }, LayoutParams(WRAP, WRAP).apply { marginStart = dpI(8f) })
+        row.alpha = 1f
+        row.translationY = 0f
+        row.scaleX = 1f
+        row.scaleY = 1f
+        onNeedFocus?.invoke(input)
+    }
+
+    private fun glassBg() = GradientDrawable().apply {
+        cornerRadius = dpF(24f)
+        setColor(if (st.dark) 0xE62A2A30.toInt() else 0xEBFFFFFF.toInt())
+        setStroke(dpI(1f), 0x55FFFFFF)
+    }
+
+    private fun pill(label: String, icon: Drawable?, onClick: () -> Unit): TextView {
+        return TextView(ctx).apply {
+            text = label
+            textSize = 15f * st.textScale
+            setTextColor(fg)
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER_VERTICAL
+            minHeight = dpI(48f)
+            setPadding(dpI(if (icon != null) 14f else 22f), 0, dpI(22f), 0)
+            compoundDrawablePadding = dpI(8f)
+            icon?.let {
+                it.setBounds(0, 0, dpI(26f), dpI(26f))
+                setCompoundDrawablesRelative(it, null, null, null)
+            }
+            background = glassBg()
+            setOnClickListener { onClick() }
+        }
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/NotifService.kt=====
+package com.example.fluidnotif
+
+import android.app.Notification
+import android.app.RemoteInput
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+
+class NotifService : NotificationListenerService() {
+
+    private val skipCategories = setOf(
+        Notification.CATEGORY_TRANSPORT, Notification.CATEGORY_PROGRESS,
+        Notification.CATEGORY_SERVICE, Notification.CATEGORY_SYSTEM,
+        Notification.CATEGORY_STATUS
+    )
+
+    override fun onNotificationPosted(sbn: StatusBarNotification) {
+        val n = sbn.notification
+        val st = Style(getSharedPreferences("fluid", Context.MODE_PRIVATE))
+
+        if (sbn.packageName in st.blocked) return
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+        if (st.skipOngoing && (sbn.isOngoing || n.category in skipCategories)) return
+
+        val ex = n.extras
+        val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = (ex.getCharSequence(Notification.EXTRA_BIG_TEXT)
+            ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
+        if (title.isEmpty() && text.isEmpty()) return
+
+        val pm = packageManager
+        val pkg = sbn.packageName
+        val appName = try {
+            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+        } catch (e: Exception) { pkg }
+
+        val acts = n.actions.orEmpty()
+        val replyAct = acts.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
+        val readAct = acts.firstOrNull {
+            it.semanticAction == Notification.Action.SEMANTIC_ACTION_MARK_AS_READ ||
+                it.title?.contains("read", ignoreCase = true) == true
+        }
+        val ri = replyAct?.remoteInputs?.firstOrNull()
+
+        val data = NotifData(
+            appName = appName,
+            icon = { try { pm.getApplicationIcon(pkg) } catch (e: Exception) { null } },
+            title = title,
+            text = text,
+            canReply = ri != null,
+            onOpen = {
+                try { n.contentIntent?.send() } catch (_: Exception) {}
+                cancelNotification(sbn.key)
+            },
+            onRead = {
+                try { readAct?.actionIntent?.send() } catch (_: Exception) {}
+                cancelNotification(sbn.key)
+            },
+            onReply = { reply ->
+                try {
+                    if (ri != null) {
+                        val i = Intent()
+                        val b = Bundle().apply { putCharSequence(ri.resultKey, reply) }
+                        RemoteInput.addResultsToIntent(arrayOf(ri), i, b)
+                        replyAct.actionIntent.send(applicationContext, 0, i)
+                    }
+                } catch (_: Exception) {}
+                cancelNotification(sbn.key)
+            }
+        )
+        OverlayController.show(applicationContext, data)
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/Opts.kt=====
+package com.example.fluidnotif
+
+import android.content.SharedPreferences
+
+enum class T { SWITCH, SLIDER, CHOICE }
+
+data class Opt(
+    val key: String,
+    val title: String,
+    val type: T,
+    val def: Int,
+    val min: Int = 0,
+    val max: Int = 1,
+    val unit: String = "",
+    val choices: List<String> = emptyList(),
+    val section: String = ""
+)
+
+/** Single source of truth for every setting: the settings screen is generated from this list. */
+object Opts {
+    val EDGE_COLORS = listOf(
+        "Purple" to 0xFFA98BFF.toInt(),
+        "Cyan" to 0xFF4FD8FF.toInt(),
+        "Pink" to 0xFFFF7AC8.toInt(),
+        "Orange" to 0xFFFFB066.toInt(),
+        "Green" to 0xFF6BE3A0.toInt(),
+        "White" to 0xFFFFFFFF.toInt()
+    )
+    private val colorNames = EDGE_COLORS.map { it.first }
+
+    private fun sl(sec: String, key: String, title: String, def: Int, min: Int, max: Int, unit: String = "") =
+        Opt(key, title, T.SLIDER, def, min, max, unit, section = sec)
+
+    private fun sw(sec: String, key: String, title: String, def: Int) =
+        Opt(key, title, T.SWITCH, def, section = sec)
+
+    private fun ch(sec: String, key: String, title: String, def: Int, choices: List<String>) =
+        Opt(key, title, T.CHOICE, def, choices = choices, section = sec)
+
+    val list = listOf(
+        // Animation
+        sl("Animation", "open_stiffness", "Open speed (spring stiffness)", 320, 100, 1000),
+        sl("Animation", "open_damping", "Open bounce (lower = bouncier)", 72, 20, 100, "%"),
+        sl("Animation", "close_stiffness", "Close speed", 420, 100, 1000),
+        sl("Animation", "stay_s", "Stay on screen", 6, 1, 20, " s"),
+        sl("Animation", "btn_delay", "Buttons appear after", 140, 0, 600, " ms"),
+        sl("Animation", "text_blur", "Text blur while appearing", 18, 0, 40, " dp"),
+        sw("Animation", "haptic", "Haptic tick when it appears", 1),
+        // Look
+        sw("Look", "dark", "Dark glass", 0),
+        sl("Look", "glass_alpha", "Glass opacity", 88, 30, 100, "%"),
+        sl("Look", "corner", "Corner radius", 28, 8, 44, " dp"),
+        sl("Look", "margin", "Side margin", 8, 0, 32, " dp"),
+        sl("Look", "top_gap", "Gap below camera", 6, -12, 40, " dp"),
+        sl("Look", "icon_size", "Icon size", 40, 24, 60, " dp"),
+        sl("Look", "text_scale", "Text size", 100, 80, 140, "%"),
+        sw("Look", "edge_on", "Glowing edge", 1),
+        sl("Look", "edge_w", "Edge thickness (tenths of dp)", 15, 5, 50),
+        sl("Look", "glow", "Edge glow", 18, 0, 100, "%"),
+        ch("Look", "edge_c1", "Edge colour 1", 0, colorNames),
+        ch("Look", "edge_c2", "Edge colour 2", 1, colorNames),
+        // Content
+        sw("Content", "hide", "Hide message text (\"Message hidden\")", 0),
+        sw("Content", "buttons", "Show action buttons", 1),
+        sw("Content", "btn_reply", "Reply button", 1),
+        sw("Content", "btn_read", "Mark as read button", 1),
+        // Behaviour
+        sw("Behaviour", "skip_ongoing", "Ignore ongoing (music, calls, timers)", 1),
+        sw("Behaviour", "blur", "Real background blur (experimental)", 0),
+        sl("Behaviour", "blur_r", "Blur strength", 28, 5, 60, " dp")
+    )
+
+    private val defaults = list.associate { it.key to it.def }
+
+    fun i(sp: SharedPreferences, key: String): Int = sp.getInt(key, defaults.getValue(key))
+    fun b(sp: SharedPreferences, key: String): Boolean = i(sp, key) != 0
+}
+
+/** Snapshot of all settings, read once per notification. */
+class Style(private val sp: SharedPreferences) {
+    private fun i(k: String) = Opts.i(sp, k)
+    private fun b(k: String) = Opts.b(sp, k)
+
+    val openStiffness = i("open_stiffness").toFloat()
+    val openDamping = i("open_damping") / 100f
+    val closeStiffness = i("close_stiffness").toFloat()
+    val stayMs = i("stay_s") * 1000L
+    val btnDelay = i("btn_delay").toLong()
+    val textBlurDp = i("text_blur").toFloat()
+    val haptic = b("haptic")
+
+    val dark = b("dark")
+    val glassAlpha = i("glass_alpha") * 255 / 100
+    val cornerDp = i("corner").toFloat()
+    val marginDp = i("margin").toFloat()
+    val topGapDp = i("top_gap").toFloat()
+    val iconDp = i("icon_size").toFloat()
+    val textScale = i("text_scale") / 100f
+    val edgeOn = b("edge_on")
+    val edgeWDp = i("edge_w") / 10f
+    val glowAlpha = i("glow") * 255 / 100
+    val c1 = Opts.EDGE_COLORS[i("edge_c1").coerceIn(0, Opts.EDGE_COLORS.size - 1)].second
+    val c2 = Opts.EDGE_COLORS[i("edge_c2").coerceIn(0, Opts.EDGE_COLORS.size - 1)].second
+
+    val hide = b("hide")
+    val buttons = b("buttons")
+    val btnReply = b("btn_reply")
+    val btnRead = b("btn_read")
+
+    val skipOngoing = b("skip_ongoing")
+    val blur = b("blur")
+    val blurDp = i("blur_r").toFloat()
+    val blocked: Set<String> = sp.getStringSet("blocked", emptySet()) ?: emptySet()
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/OverlayController.kt=====
+package com.example.fluidnotif
+
+import android.content.Context
+import android.graphics.PixelFormat
+import android.graphics.RectF
+import android.provider.Settings
+import android.view.ContextThemeWrapper
+import android.view.Gravity
+import android.view.WindowInsets
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+
+/** Puts a [NotifPanel] into a system overlay window anchored at the camera. */
+object OverlayController {
+
+    private var wm: WindowManager? = null
+    private var panel: NotifPanel? = null
+
+    fun show(base: Context, d: NotifData) {
+        if (!Settings.canDrawOverlays(base)) return
+        removeNow()
+
+        val st = Style(base.getSharedPreferences("fluid", Context.MODE_PRIVATE))
+        val ctx = ContextThemeWrapper(base, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
+        val manager = base.getSystemService(WindowManager::class.java)
+        wm = manager
+
+        // Where is the camera?
+        val metrics = manager.currentWindowMetrics
+        val screenW = metrics.bounds.width()
+        val insets = metrics.windowInsets
+        val statusTop = insets.getInsets(WindowInsets.Type.statusBars()).top
+        val cut = insets.displayCutout?.boundingRects?.firstOrNull { it.top <= 0 }
+        val cam = if (cut != null) RectF(cut) else RectF(
+            screenW / 2f - ctx.dpF(14f), ctx.dpF(8f),
+            screenW / 2f + ctx.dpF(14f), ctx.dpF(36f)
+        )
+        cam.inset(-ctx.dpF(3f), -ctx.dpF(3f))
+
+        val margin = ctx.dpI(st.marginDp)
+        val cardTop = (maxOf(cam.bottom.toInt(), statusTop) + ctx.dpI(st.topGapDp)).coerceAtLeast(0)
+        val start = RectF(
+            cam.left - margin, cam.top - cardTop,
+            cam.right - margin, cam.bottom - cardTop
+        )
+
+        val p = NotifPanel(ctx, d, st, start, cardTop)
+
+        val lp = WindowManager.LayoutParams(
+            screenW - margin * 2,
+            WRAP,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = 0
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            if (st.blur) {
+                // Experimental: blurs the whole window rectangle, not only the rounded card.
+                flags = flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                blurBehindRadius = ctx.dpI(st.blurDp)
+            }
+        }
+
+        p.onClosed = { if (panel === p) removeNow() }
+        p.onNeedFocus = { input ->
+            // Make the overlay focusable so the keyboard can appear.
+            lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            try { manager.updateViewLayout(p, lp) } catch (_: Exception) {}
+            input.requestFocus()
+            input.postDelayed({
+                ctx.getSystemService(InputMethodManager::class.java)
+                    .showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+            }, 150)
+        }
+
+        manager.addView(p, lp)
+        panel = p
+        p.open()
+    }
+
+    fun dismiss() {
+        panel?.close()
+    }
+
+    private fun removeNow() {
+        panel?.let {
+            it.release()
+            try { wm?.removeViewImmediate(it) } catch (_: Exception) {}
+        }
+        panel = null
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/SettingsActivity.kt=====
+package com.example.fluidnotif
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
+import android.widget.TextView
+
+class SettingsActivity : Activity() {
+
+    private lateinit var sp: SharedPreferences
+    private lateinit var stage: FrameLayout
+    private val h = Handler(Looper.getMainLooper())
+    private var panel: NotifPanel? = null
+    private val playRun = Runnable { play() }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        sp = getSharedPreferences("fluid", Context.MODE_PRIVATE)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xFFF2F2F5.toInt())
+        }
+
+        root.addView(TextView(this).apply {
+            text = "←   Fluid Notifications"
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dpI(18f), dpI(40f), dpI(18f), dpI(8f))
+            setOnClickListener { finish() }
+        })
+
+        // Live preview: a gradient "phone" with a camera dot.
+        val preview = FrameLayout(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFFFFB27A.toInt(), 0xFFA9DCEB.toInt(), 0xFFB5F0D0.toInt())
+            ).apply { cornerRadius = dpF(28f) }
+            setOnClickListener { schedulePlay(0) }
+        }
+        val dot = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFF000000.toInt())
+            }
+        }
+        preview.addView(dot, FrameLayout.LayoutParams(dpI(14f), dpI(14f), Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            .apply { topMargin = dpI(10f) })
+        stage = FrameLayout(this)
+        preview.addView(stage, FrameLayout.LayoutParams(MATCH, MATCH))
+        root.addView(preview, LinearLayout.LayoutParams(MATCH, dpI(250f)).apply {
+            setMargins(dpI(14f), dpI(6f), dpI(14f), dpI(10f))
+        })
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpI(18f), 0, dpI(18f), dpI(40f))
+        }
+        buildOptions(col)
+        root.addView(ScrollView(this).apply { addView(col) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+        setContentView(root)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        schedulePlay(350)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        h.removeCallbacksAndMessages(null)
+        releasePanel()
+    }
+
+    private fun releasePanel() {
+        panel?.let {
+            it.release()
+            stage.removeView(it)
+        }
+        panel = null
+    }
+
+    private fun schedulePlay(ms: Long) {
+        h.removeCallbacks(playRun)
+        h.postDelayed(playRun, ms)
+    }
+
+    private fun play() {
+        releasePanel()
+        val w = stage.width
+        if (w == 0) { schedulePlay(100); return }
+        val st = Style(sp)
+        val m = dpI(st.marginDp)
+        val cardTop = (dpI(34f) + dpI(st.topGapDp)).coerceAtLeast(0)
+        val cx = (w - 2 * m) / 2f
+        val cy = dpF(17f)
+        val start = RectF(
+            cx - dpF(10f), cy - dpF(10f) - cardTop,
+            cx + dpF(10f), cy + dpF(10f) - cardTop
+        )
+        val p = NotifPanel(this, Fakes.scenarios[0].toData(this, toasts = false), st, start, cardTop)
+        p.onClosed = {
+            if (panel === p) {
+                stage.removeView(p)
+                panel = null
+                h.postDelayed(playRun, 900)
+            }
+        }
+        stage.addView(p, FrameLayout.LayoutParams(MATCH, WRAP).apply { setMargins(m, 0, m, 0) })
+        panel = p
+        p.open(haptic = false)
+    }
+
+    // ---- Settings UI generated from Opts.list ----
+    private fun buildOptions(col: LinearLayout) {
+        var lastSection = ""
+        for (o in Opts.list) {
+            if (o.section != lastSection) {
+                lastSection = o.section
+                col.addView(TextView(this).apply {
+                    text = o.section.uppercase()
+                    textSize = 12f
+                    setTypeface(typeface, Typeface.BOLD)
+                    setTextColor(0xFF5B6CFF.toInt())
+                    setPadding(0, dpI(22f), 0, dpI(6f))
+                })
+            }
+            when (o.type) {
+                T.SWITCH -> col.addView(Switch(this).apply {
+                    text = o.title
+                    textSize = 15f
+                    isChecked = Opts.b(sp, o.key)
+                    setPadding(0, dpI(10f), 0, dpI(10f))
+                    setOnCheckedChangeListener { _, v ->
+                        sp.edit().putInt(o.key, if (v) 1 else 0).apply()
+                        schedulePlay(250)
+                    }
+                })
+                T.SLIDER -> {
+                    val label = TextView(this).apply { textSize = 15f; setPadding(0, dpI(8f), 0, 0) }
+                    fun refresh(v: Int) { label.text = "${o.title}: $v${o.unit}" }
+                    val cur = Opts.i(sp, o.key)
+                    refresh(cur)
+                    val bar = SeekBar(this).apply {
+                        max = o.max - o.min
+                        progress = cur - o.min
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                                val v = p + o.min
+                                refresh(v)
+                                if (fromUser) {
+                                    sp.edit().putInt(o.key, v).apply()
+                                    schedulePlay(300)
+                                }
+                            }
+                            override fun onStartTrackingTouch(s: SeekBar) {}
+                            override fun onStopTrackingTouch(s: SeekBar) {}
+                        })
+                    }
+                    col.addView(label)
+                    col.addView(bar)
+                }
+                T.CHOICE -> {
+                    val tv = TextView(this).apply {
+                        textSize = 15f
+                        setPadding(0, dpI(12f), 0, dpI(12f))
+                    }
+                    fun refresh() {
+                        tv.text = "${o.title}: ${o.choices[Opts.i(sp, o.key).coerceIn(0, o.choices.size - 1)]}  ▾"
+                    }
+                    refresh()
+                    tv.setOnClickListener {
+                        AlertDialog.Builder(this)
+                            .setTitle(o.title)
+                            .setItems(o.choices.toTypedArray()) { _, which ->
+                                sp.edit().putInt(o.key, which).apply()
+                                refresh()
+                                schedulePlay(250)
+                            }.show()
+                    }
+                    col.addView(tv)
+                }
+            }
+        }
+
+        col.addView(TextView(this).apply {
+            text = "APPS"
+            textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(0xFF5B6CFF.toInt())
+            setPadding(0, dpI(22f), 0, dpI(6f))
+        })
+        col.addView(Button(this).apply {
+            text = "Choose apps to ignore…"
+            isAllCaps = false
+            setOnClickListener { pickApps() }
+        })
+        col.addView(Button(this).apply {
+            text = "Reset all settings"
+            isAllCaps = false
+            setOnClickListener {
+                sp.edit().clear().apply()
+                recreate()
+            }
+        })
+        col.addView(Button(this).apply {
+            text = "Open test lab"
+            isAllCaps = false
+            setOnClickListener { startActivity(Intent(this@SettingsActivity, TestActivity::class.java)) }
+        })
+    }
+
+    private fun pickApps() {
+        val pm = packageManager
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val apps = pm.queryIntentActivities(launcher, 0)
+            .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+            .distinctBy { it.first }
+            .sortedBy { it.second.lowercase() }
+        val blocked = (sp.getStringSet("blocked", emptySet()) ?: emptySet()).toMutableSet()
+        val checked = BooleanArray(apps.size) { apps[it].first in blocked }
+        AlertDialog.Builder(this)
+            .setTitle("Ignore these apps")
+            .setMultiChoiceItems(apps.map { it.second }.toTypedArray(), checked) { _, i, c ->
+                if (c) blocked.add(apps[i].first) else blocked.remove(apps[i].first)
+            }
+            .setPositiveButton("Save") { _, _ ->
+                sp.edit().putStringSet("blocked", HashSet(blocked)).apply()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/TestActivity.kt=====
+package com.example.fluidnotif
+
+import android.Manifest
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.RemoteInput
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Typeface
+import android.graphics.drawable.Icon
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.text.InputType
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
+
+class TestActivity : Activity() {
+
+    private val h = Handler(Looper.getMainLooper())
+    private lateinit var delay: EditText
+    private lateinit var fApp: EditText
+    private lateinit var fTitle: EditText
+    private lateinit var fText: EditText
+    private lateinit var fReply: Switch
+    private var notifId = 100
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpI(18f), dpI(44f), dpI(18f), dpI(32f))
+        }
+
+        fun header(s: String) = col.addView(TextView(this).apply {
+            text = s
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(0xFF5B6CFF.toInt())
+            setPadding(0, dpI(18f), 0, dpI(6f))
+        })
+        fun btn(label: String, onClick: () -> Unit) = col.addView(Button(this).apply {
+            text = label
+            isAllCaps = false
+            setOnClickListener { onClick() }
+        }, LinearLayout.LayoutParams(MATCH, WRAP))
+        fun field(hint: String, init: String): EditText {
+            val e = EditText(this).apply { this.hint = hint; setText(init); textSize = 15f }
+            col.addView(e, LinearLayout.LayoutParams(MATCH, WRAP))
+            return e
+        }
+
+        col.addView(TextView(this).apply {
+            text = "←   Test lab"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setOnClickListener { finish() }
+        })
+        col.addView(TextView(this).apply {
+            text = "Fake notifications to try your settings. The overlay is shown directly " +
+                "(needs only \"Display over other apps\"). Use the delay to switch to the home screen first."
+            textSize = 13f
+            setPadding(0, dpI(8f), 0, 0)
+        })
+
+        header("DELAY BEFORE SHOWING (SECONDS)")
+        delay = field("seconds", "3").apply { inputType = InputType.TYPE_CLASS_NUMBER }
+
+        header("QUICK SCENARIOS")
+        Fakes.scenarios.forEach { f -> btn("${f.app}: ${f.title}") { fire(f) } }
+
+        header("CUSTOM")
+        fApp = field("App name", "Messages")
+        fTitle = field("Title", "Sam")
+        fText = field("Message", "Are we still on for lunch today?")
+        fReply = Switch(this).apply { text = "Can reply"; isChecked = true; setPadding(0, dpI(8f), 0, dpI(8f)) }
+        col.addView(fReply)
+        btn("Show custom fake overlay") { fire(custom()) }
+
+        header("MORE")
+        btn("Burst: 3 notifications in a row") {
+            Fakes.scenarios.take(3).forEachIndexed { i, f -> fire(f, extraMs = i * 2500L) }
+        }
+        btn("Send as REAL notification (full pipeline)") { sendReal(custom()) }
+        btn("Dismiss current overlay") { OverlayController.dismiss() }
+
+        setContentView(ScrollView(this).apply { addView(col) })
+    }
+
+    private fun custom() = Fake(
+        fApp.text.toString().ifBlank { "App" },
+        fTitle.text.toString(),
+        fText.text.toString(),
+        0xFF8E5BFF.toInt(),
+        fReply.isChecked
+    )
+
+    private fun delayMs(): Long = (delay.text.toString().toLongOrNull() ?: 0L) * 1000L
+
+    private fun fire(f: Fake, extraMs: Long = 0L) {
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Grant \"Display over other apps\" first", Toast.LENGTH_LONG).show()
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        val total = delayMs() + extraMs
+        if (total >= 1000 && extraMs == 0L) {
+            Toast.makeText(this, "Showing in ${total / 1000} s — go to the home screen", Toast.LENGTH_SHORT).show()
+        }
+        val data = f.toData(this)
+        h.postDelayed({ OverlayController.show(applicationContext, data) }, total)
+    }
+
+    private fun sendReal(f: Fake) {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            return
+        }
+        val total = delayMs()
+        Toast.makeText(this, "Real notification in ${total / 1000} s", Toast.LENGTH_SHORT).show()
+        h.postDelayed({
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel("test", "Test", NotificationManager.IMPORTANCE_DEFAULT)
+            )
+            val pi = PendingIntent.getBroadcast(
+                this, 0, Intent("com.example.fluidnotif.NOOP").setPackage(packageName),
+                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val builder = Notification.Builder(this, "test")
+                .setSmallIcon(R.drawable.ic_check)
+                .setContentTitle(f.title)
+                .setContentText(f.text)
+            if (f.canReply) {
+                val ri = RemoteInput.Builder("reply").setLabel("Reply").build()
+                builder.addAction(
+                    Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_check), "Reply", pi)
+                        .addRemoteInput(ri)
+                        .setSemanticAction(Notification.Action.SEMANTIC_ACTION_REPLY).build()
+                )
+            }
+            builder.addAction(
+                Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_check), "Mark as read", pi)
+                    .setSemanticAction(Notification.Action.SEMANTIC_ACTION_MARK_AS_READ).build()
+            )
+            nm.notify(notifId++, builder.build())
+        }, total)
+    }
+}
+=====FILE: app/src/main/java/com/example/fluidnotif/Util.kt=====
+package com.example.fluidnotif
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.view.View
+import android.view.ViewGroup
+import kotlin.math.min
+
+const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+fun Context.dpF(v: Float): Float = v * resources.displayMetrics.density
+fun Context.dpI(v: Float): Int = (v * resources.displayMetrics.density).toInt()
+fun View.dpF(v: Float): Float = context.dpF(v)
+fun View.dpI(v: Float): Int = context.dpI(v)
+fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
+
+/** Everything the overlay needs to show one notification (real or fake). */
+data class NotifData(
+    val appName: String,
+    val icon: () -> Drawable?,
+    val title: String,
+    val text: String,
+    val canReply: Boolean,
+    val onOpen: () -> Unit,
+    val onRead: () -> Unit,
+    val onReply: (String) -> Unit
+)
+
+/** Simple round letter icon used for fake notifications. */
+class LetterIcon(private val c: Int, private val letter: String) : Drawable() {
+    private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = c }
+    private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+
+    override fun draw(canvas: Canvas) {
+        val b = bounds
+        val r = min(b.width(), b.height()) / 2f
+        canvas.drawCircle(b.exactCenterX(), b.exactCenterY(), r, bg)
+        tp.textSize = r * 1.05f
+        canvas.drawText(letter, b.exactCenterX(), b.exactCenterY() - (tp.ascent() + tp.descent()) / 2f, tp)
+    }
+
+    override fun setAlpha(alpha: Int) { bg.alpha = alpha }
+    override fun setColorFilter(colorFilter: ColorFilter?) { bg.colorFilter = colorFilter }
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+}
+=====FILE: app/src/main/res/drawable/ic_check.xml=====
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path
+        android:strokeColor="#111114"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M5,12.5 L10,17.5 L19.5,7" />
+</vector>
+=====FILE: app/src/main/res/drawable/ic_launcher.xml=====
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FF9A62" android:pathData="M0,0h108v108h-108z" />
+    <path android:fillColor="#8ED0F5" android:pathData="M108,0 L108,108 L0,108 Z" />
+    <path android:fillColor="#FFFFFF" android:fillAlpha="0.92"
+        android:pathData="M36,46 L72,46 A11,11 0 0 1 72,68 L36,68 A11,11 0 0 1 36,46 Z" />
+    <path android:fillColor="#111114"
+        android:pathData="M50,32 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+</vector>
+=====FILE: app/src/main/res/values/strings.xml=====
+<resources>
+    <string name="app_name">Fluid Notifications</string>
+</resources>
+=====FILE: build.gradle.kts=====
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+=====FILE: gradle.properties=====
+org.gradle.jvmargs=-Xmx2g
+android.useAndroidX=true
+kotlin.code.style=official
+=====FILE: settings.gradle.kts=====
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "FluidNotif"
+include(":app")
