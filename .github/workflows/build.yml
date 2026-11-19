@@ -1,0 +1,35 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project
+        run: |
+          python3 - <<'PY'
+          import os, re
+          txt = open('bundle.txt', encoding='utf-8').read()
+          parts = re.split(r'^=====FILE: (.+?)=====\n', txt, flags=re.M)
+          for i in range(1, len(parts), 2):
+              p = parts[i].strip()
+              d = os.path.dirname(p)
+              if d:
+                  os.makedirs(d, exist_ok=True)
+              open(p, 'w', encoding='utf-8').write(parts[i+1])
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - run: gradle assembleDebug --no-daemon --stacktrace
+      - run: cp app/build/outputs/apk/debug/app-debug.apk FluidNotifications.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FluidNotifications-apk
+          path: FluidNotifications.apk
